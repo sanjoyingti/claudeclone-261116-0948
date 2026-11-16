@@ -9,29 +9,14 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.SocketTimeoutException
-import java.net.UnknownHostException
 import java.net.URLEncoder
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
-import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLException
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
 
 class ApiRepository {
     private val client: OkHttpClient by lazy {
-        val trustManager = object : X509TrustManager {
-            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
-        }
-        val ssl = SSLContext.getInstance("TLS").apply {
-            init(null, arrayOf<TrustManager>(trustManager), SecureRandom())
-        }
         OkHttpClient.Builder()
-            .sslSocketFactory(ssl.socketFactory, trustManager)
-            .hostnameVerifier { _, _ -> true }
             .connectTimeout(25, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
@@ -53,13 +38,16 @@ class ApiRepository {
         val body = makeBody(profile, dialect, text, attachment, history)
         val request = buildRequest(profile, dialect, url)
             .post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .header("Accept", if (profile.streaming) "text/event-stream, application/json" else "application/json")
+            .header(
+                "Accept",
+                if (profile.streaming) "text/event-stream, application/json" else "application/json"
+            )
             .build()
 
         return execute(request, profile) { responseBody ->
             val reply = parseReply(profile, dialect, responseBody)
             ApiResult(
-                text = reply.ifBlank { "The API returned an empty response." },
+                text = reply,
                 report = "Connected successfully. HTTP response received from ${safeUrl(request.url)}."
             )
         }
@@ -77,7 +65,7 @@ class ApiRepository {
         return execute(request, profile) { body ->
             val root = runCatching { JSONObject(body) }.getOrNull()
                 ?: throw IllegalStateException(
-                    "The model-list endpoint returned non-JSON data. This server may not support model discovery."
+                    "The model-list endpoint returned non-JSON data. Model discovery may not be supported by this server."
                 )
             val models = extractModels(root)
             if (models.isEmpty()) {
@@ -93,37 +81,28 @@ class ApiRepository {
         val base = profile.baseUrl.trim().lowercase()
         val endpoint = profile.endpointPath.trim().lowercase()
         return when {
-            base.contains("generativelanguage.googleapis.com") ||
-                base.contains("googleapis.com") ||
-                endpoint.contains("generatecontent") ||
-                profile.dialect.equals("Google-style", ignoreCase = true) -> "Google-style"
+            profile.dialect.equals("Google-style", ignoreCase = true) ||
+                base.contains("generativelanguage.googleapis.com") ||
+                endpoint.contains("generatecontent") -> "Google-style"
 
-            base.contains("api.anthropic.com") ||
-                endpoint.endsWith("/messages") ||
-                profile.dialect.equals("Anthropic-compatible", ignoreCase = true) -> "Anthropic-compatible"
+            profile.dialect.equals("Anthropic-compatible", ignoreCase = true) ||
+                base.contains("api.anthropic.com") ||
+                endpoint.endsWith("/messages") -> "Anthropic-compatible"
 
             else -> "OpenAI-compatible"
         }
     }
 
     private fun chatUrl(profile: ApiProfile, dialect: String): HttpUrl {
-        val base = normalizedBase(profile.baseUrl)
-        val defaultEndpoint = when (dialect) {
-            "Anthropic-compatible" -> "v1/messages"
-            "Google-style" -> "v1beta/models/${profile.model}:generateContent"
-            else -> "v1/chat/completions"
-        }
-        val configured = profile.endpointPath.trim()
-        val endpoint = when {
-            dialect == "Google-style" && configured.contains("generateContent", ignoreCase = true) ->
-                configured.replace("{model}", profile.model)
-            dialect == "Anthropic-compatible" && configured.endsWith("/messages", ignoreCase = true) ->
-                configured
-            dialect == "OpenAI-compatible" &&
-                configured.endsWith("/chat/completions", ignoreCase = true) -> configured
-            else -> defaultEndpoint
-        }
-        return appendPath(base, endpoint)
+        val endpoint = profile.endpointPath.trim().ifBlank {
+            when (dialect) {
+                "Anthropic-compatible" -> "/v1/messages"
+                "Google-style" -> "/v1beta/models/{model}:generateContent"
+                else -> "/v1/chat/completions"
+            }
+        }.replace("{model}", profile.model)
+
+        return appendPath(normalizedBase(profile.baseUrl), endpoint)
     }
 
     private fun modelsUrl(profile: ApiProfile, dialect: String): HttpUrl {
@@ -133,67 +112,44 @@ class ApiRepository {
     }
 
     private fun normalizedBase(input: String): HttpUrl {
-        val trimmed = input.trim()
+        val trimmed = input.trim().trimEnd('/')
         require(trimmed.isNotBlank()) { "Enter a base URL first." }
         require(
             trimmed.startsWith("https://", ignoreCase = true) ||
                 trimmed.startsWith("http://", ignoreCase = true)
         ) { "Base URL must start with http:// or https://." }
 
-        var base = trimmed.toHttpUrlOrNull()
+        val url = trimmed.toHttpUrlOrNull()
             ?: throw IllegalArgumentException("The base URL is invalid. Check its scheme, host, and port.")
-        require(base.host.isNotBlank()) { "Base URL must include a server host." }
-
-        val path = base.encodedPath.trimEnd('/')
-        val generationEndpoint = Regex(
-            """/(?:v1beta/)?models/[^/]+:generatecontent$""",
-            RegexOption.IGNORE_CASE
-        )
-        val removable = listOf(
-            "/v1/chat/completions",
-            "/chat/completions",
-            "/v1/messages",
-            "/messages",
-            "/v1beta/models",
-            "/v1/models",
-            "/models"
-        ).firstOrNull { path.endsWith(it, ignoreCase = true) }
-            ?: generationEndpoint.find(path)?.value
-
-        if (removable != null) {
-            base = base.newBuilder()
-                .encodedPath(path.dropLast(removable.length).ifBlank { "/" })
-                .build()
-        }
-        return base
+        require(url.host.isNotBlank()) { "Base URL must include a server host." }
+        return url
     }
 
     private fun appendPath(base: HttpUrl, requestedPath: String): HttpUrl {
-        val absolute = requestedPath.trim()
-        if (absolute.startsWith("https://", true) || absolute.startsWith("http://", true)) {
-            return absolute.toHttpUrlOrNull()
+        val path = requestedPath.trim()
+        if (path.startsWith("https://", true) || path.startsWith("http://", true)) {
+            return path.toHttpUrlOrNull()
                 ?: throw IllegalArgumentException("The configured endpoint URL is invalid.")
         }
 
-        val path = absolute.substringBefore('?').trim('/')
-        val pathParts = path.split('/').filter(String::isNotBlank)
+        val endpointPath = path.substringBefore('?').trim('/')
+        val endpointParts = endpointPath.split('/').filter(String::isNotBlank)
         val baseParts = base.encodedPath.split('/').filter(String::isNotBlank)
-        val overlap = (minOf(baseParts.size, pathParts.size) downTo 1)
+
+        // Avoid duplicating a shared prefix, while retaining the complete user-provided base path.
+        val overlap = (minOf(baseParts.size, endpointParts.size) downTo 1)
             .firstOrNull { count ->
                 baseParts.takeLast(count).map(::decodePath) ==
-                    pathParts.take(count).map(::decodePath)
+                    endpointParts.take(count).map(::decodePath)
             } ?: 0
-        val remaining = pathParts.drop(overlap)
 
         val builder = base.newBuilder()
-        remaining.forEach { part -> builder.addPathSegment(decodePath(part)) }
+        endpointParts.drop(overlap).forEach { builder.addPathSegment(decodePath(it)) }
 
-        val pathQuery = absolute.substringAfter('?', "").takeIf(String::isNotBlank)
-        if (pathQuery != null) {
-            pathQuery.split('&').forEach { pair ->
-                val key = pair.substringBefore('=')
-                val value = pair.substringAfter('=', "")
-                builder.addQueryParameter(key, value)
+        val query = path.substringAfter('?', "").takeIf(String::isNotBlank)
+        if (query != null) {
+            query.split('&').filter(String::isNotBlank).forEach { pair ->
+                builder.addQueryParameter(pair.substringBefore('='), pair.substringAfter('=', ""))
             }
         }
         return builder.build()
@@ -203,23 +159,25 @@ class ApiRepository {
         val builder = Request.Builder().url(url)
         val key = profile.authValue.trim()
         if (key.isNotBlank()) {
-            when (dialect) {
-                "Google-style" -> builder.header("x-goog-api-key", key)
-                "Anthropic-compatible" -> {
-                    builder.header("x-api-key", key)
-                    builder.header("anthropic-version", "2023-06-01")
-                }
-                else -> {
-                    val prefix = profile.authPrefix.trim()
-                    val value = if (prefix.isBlank() || prefix.equals("none", true)) {
-                        key
-                    } else {
-                        "$prefix $key"
-                    }
-                    builder.header(profile.authHeader.ifBlank { "Authorization" }, value)
-                }
+            val configuredHeader = profile.authHeader.trim()
+            val header = when {
+                configuredHeader.isNotBlank() &&
+                    !configuredHeader.equals("Authorization", ignoreCase = true) -> configuredHeader
+                dialect == "Google-style" -> "x-goog-api-key"
+                dialect == "Anthropic-compatible" -> "x-api-key"
+                else -> configuredHeader.ifBlank { "Authorization" }
             }
-        } else if (dialect == "Anthropic-compatible") {
+            val prefix = when {
+                configuredHeader.isNotBlank() &&
+                    !configuredHeader.equals("Authorization", ignoreCase = true) -> profile.authPrefix.trim()
+                dialect == "Google-style" || dialect == "Anthropic-compatible" -> ""
+                else -> profile.authPrefix.trim()
+            }
+            val value = if (prefix.isBlank() || prefix.equals("none", true)) key else "$prefix $key"
+            builder.header(header, value)
+        }
+
+        if (dialect == "Anthropic-compatible") {
             builder.header("anthropic-version", "2023-06-01")
         }
 
@@ -231,7 +189,10 @@ class ApiRepository {
                 require(colon > 0) {
                     "An additional header is invalid. Use one 'Name: value' header per line."
                 }
-                builder.header(line.substring(0, colon).trim(), line.substring(colon + 1).trim())
+                val name = line.substring(0, colon).trim()
+                val value = line.substring(colon + 1).trim()
+                require(name.isNotBlank()) { "An additional header must have a name." }
+                builder.header(name, value)
             }
         return builder
     }
@@ -246,9 +207,9 @@ class ApiRepository {
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     val explanation = when (response.code) {
-                        401, 403 -> "Authentication was rejected. Check the API key and authentication format."
-                        402 -> "Payment is required by the API provider. Check the provider's billing page for a required top-up, credits, or an active payment method."
-                        404 -> "The endpoint was not found. Check the base URL and API format."
+                        401, 403 -> "Authentication was rejected. Check the API key, header name, and authentication prefix."
+                        402 -> "Payment is required by the API provider. Check billing, credits, and payment method."
+                        404 -> "The endpoint was not found. Check the base URL and endpoint path."
                         400, 422 -> "The server rejected the request. Check the model ID and request format."
                         429 -> "The server is rate limiting requests. Wait and try again."
                         in 500..599 -> "The API server returned an error."
@@ -272,16 +233,19 @@ class ApiRepository {
                 is UnknownHostException ->
                     "Could not resolve the server host. Check the base URL and network connection."
                 is SSLException ->
-                    "TLS connection failed. Check that the server supports HTTPS and can complete a TLS handshake."
+                    "TLS connection failed. Check the server certificate and HTTPS configuration."
                 is java.net.ConnectException ->
                     "Could not connect to the server. Check the host, port, and network access."
                 is SocketTimeoutException ->
                     "The server timed out. Check that it is reachable and try again."
                 else ->
-                    "Request failed. Check the URL, network, model ID, and API format."
+                    "Request failed. Check the URL, network, model ID, headers, and API format."
             }
             val detail = redact(e.message ?: e.javaClass.simpleName, profile.authValue).take(500)
-            throw IllegalStateException("$reason\n${e.javaClass.simpleName}: $detail", e)
+            throw IllegalStateException(
+                "$reason\n${e.javaClass.simpleName}: $detail\nURL: ${safeUrl(request.url)}",
+                e
+            )
         }
     }
 
@@ -337,7 +301,7 @@ class ApiRepository {
         val parts = JSONArray()
         if (attachment != null) {
             require(attachment.mimeType.startsWith("image/") || attachment.mimeType == "application/pdf") {
-                "This API format supports image or PDF attachments only."
+                "This Anthropic-compatible request supports image or PDF attachments only. The selected server may have different upload capabilities."
             }
             val type = if (attachment.mimeType == "application/pdf") "document" else "image"
             parts.put(
@@ -437,7 +401,7 @@ class ApiRepository {
                 )
         } else {
             throw IllegalArgumentException(
-                "This OpenAI-compatible chat endpoint cannot reliably accept PDF attachments. Use an image or a server that supports PDF input."
+                "This OpenAI-compatible request implementation can send images only. The configured server may support other file types through a different upload protocol."
             )
         }
         messages.put(JSONObject().put("role", "user").put("content", content))
@@ -480,12 +444,18 @@ class ApiRepository {
             return replacePlaceholders(
                 profile.responseTemplate,
                 mapOf("body" to body, "value" to value)
-            )
+            ).ifBlank {
+                throw IllegalStateException("The configured response template produced an empty reply.")
+            }
         }
         return extractReply(profile, dialect, body)
     }
 
     private fun extractReply(profile: ApiProfile, dialect: String, body: String): String {
+        if (body.isBlank()) {
+            throw IllegalStateException("The API returned an empty response body.")
+        }
+
         if (profile.streaming && body.lineSequence().any { it.trimStart().startsWith("data:") }) {
             val stream = StringBuilder()
             body.lineSequence()
@@ -507,15 +477,24 @@ class ApiRepository {
             if (stream.isNotEmpty()) return stream.toString()
         }
 
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return body
-        val configuredPath = profile.responsePath.trim().ifBlank {
-            when (dialect) {
-                "Anthropic-compatible" -> "content[0].text"
-                "Google-style" -> "candidates[0].content.parts[0].text"
-                else -> "choices[0].message.content"
+        val root = runCatching { JSONObject(body) }.getOrNull()
+        if (root == null) {
+            val arrayRoot = runCatching { JSONArray(body) }.getOrNull()
+            if (arrayRoot != null) {
+                val custom = profile.responsePath.trim()
+                val value = if (custom.isNotBlank()) readPath(arrayRoot, custom).asText() else null
+                return value ?: arrayRoot.toString()
             }
+            return body
         }
-        val paths = listOf(
+
+        val defaultPath = when (dialect) {
+            "Anthropic-compatible" -> "content[0].text"
+            "Google-style" -> "candidates[0].content.parts[0].text"
+            else -> "choices[0].message.content"
+        }
+        val configuredPath = profile.responsePath.trim().ifBlank { defaultPath }
+        val candidatePaths = listOf(
             configuredPath,
             "choices[0].message.content",
             "choices[0].text",
@@ -525,53 +504,76 @@ class ApiRepository {
             "response"
         ).distinct()
 
-        return paths.firstNotNullOfOrNull { readPath(root, it).asText() } ?: body
+        candidatePaths.firstNotNullOfOrNull { path ->
+            runCatching { readPath(root, path).asText() }.getOrNull()?.takeIf(String::isNotBlank)
+        }?.let { return it }
+
+        val apiError = errorDetail(body)
+        if (apiError != null) {
+            throw IllegalStateException(
+                "The server returned JSON but no assistant text could be found. Server message: ${apiError.take(400)}. Check the response path setting."
+            )
+        }
+        throw IllegalStateException(
+            "The API response was valid JSON, but no reply text was found. Check the response path setting. Response preview: ${body.take(400)}"
+        )
     }
 
+    /**
+     * Reads paths such as choices[0].message.content without regex parsing.
+     * Supports dotted object keys, numeric array indexes, and quoted bracket keys.
+     */
     private fun readPath(root: Any, path: String): Any? {
-        val normalizedPath = path.trim().removePrefix("$.")
-        if (normalizedPath.isEmpty()) return root
+        val normalized = path.trim().removePrefix("$.")
+        if (normalized.isEmpty()) return root
 
-        var current: Any? = root
+        val tokens = mutableListOf<String>()
+        val token = StringBuilder()
         var cursor = 0
 
-        while (cursor < normalizedPath.length) {
-            if (normalizedPath[cursor] == '.') {
-                cursor++
-                continue
-            }
-
-            val token: String
-            if (normalizedPath[cursor] == '[') {
-                val closingBracket = normalizedPath.indexOf(']', startIndex = cursor + 1)
-                if (closingBracket < 0) return null
-                token = normalizedPath.substring(cursor + 1, closingBracket)
-                    .trim()
-                    .removeSurrounding("\"")
-                    .removeSurrounding("'")
-                cursor = closingBracket + 1
-            } else {
-                val start = cursor
-                while (
-                    cursor < normalizedPath.length &&
-                    normalizedPath[cursor] != '.' &&
-                    normalizedPath[cursor] != '['
-                ) {
+        while (cursor < normalized.length) {
+            when (val char = normalized[cursor]) {
+                '.' -> {
+                    if (token.isNotEmpty()) {
+                        tokens += token.toString()
+                        token.setLength(0)
+                    }
                     cursor++
                 }
-                token = normalizedPath.substring(start, cursor)
+                '[' -> {
+                    if (token.isNotEmpty()) {
+                        tokens += token.toString()
+                        token.setLength(0)
+                    }
+                    val close = normalized.indexOf(']', cursor + 1)
+                    if (close < 0) return null
+                    val bracketValue = normalized.substring(cursor + 1, close).trim()
+                    val unquoted = bracketValue.removeSurrounding("\"").removeSurrounding("'")
+                    if (unquoted.isEmpty()) return null
+                    tokens += unquoted
+                    cursor = close + 1
+                }
+                else -> {
+                    token.append(char)
+                    cursor++
+                }
             }
+        }
+        if (token.isNotEmpty()) tokens += token.toString()
 
-            if (token.isEmpty()) return null
+        var current: Any? = root
+        for (part in tokens) {
             current = when (val value = current) {
-                is JSONObject -> value.opt(token).takeUnless { it == JSONObject.NULL }
-                is JSONArray -> value.opt(token.toIntOrNull() ?: return null)
-                    .takeUnless { it == JSONObject.NULL }
+                is JSONObject -> value.opt(part).takeUnless { it == JSONObject.NULL }
+                is JSONArray -> {
+                    val index = part.toIntOrNull() ?: return null
+                    if (index !in 0 until value.length()) return null
+                    value.opt(index).takeUnless { it == JSONObject.NULL }
+                }
                 else -> return null
             }
             if (current == null) return null
         }
-
         return current
     }
 

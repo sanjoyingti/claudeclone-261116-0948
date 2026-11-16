@@ -25,10 +25,18 @@ data class ChatMessage(
     val isError: Boolean = false
 )
 
+/**
+ * Attachment contents are deliberately bounded. Files that cannot safely be inlined
+ * retain their URI and metadata; this does not imply that the configured API accepts them.
+ */
 data class PendingAttachment(
     val name: String,
     val mimeType: String,
-    val base64: String
+    val base64: String = "",
+    val uri: String = "",
+    val sizeBytes: Long? = null,
+    val extractedText: String = "",
+    val archiveManifest: String = ""
 )
 
 data class ApiResult(

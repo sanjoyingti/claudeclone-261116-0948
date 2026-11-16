@@ -1,7 +1,7 @@
 package com.aibuilt.claudeclone.ui
 
-import android.util.Base64
-import android.provider.OpenableColumns
+import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,7 +14,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -26,8 +28,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.DeleteOutline
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -38,6 +41,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -52,8 +56,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.aibuilt.claudeclone.data.AttachmentProcessor
 import com.aibuilt.claudeclone.data.ChatMessage
-import com.aibuilt.claudeclone.data.PendingAttachment
 import com.aibuilt.claudeclone.viewmodel.MainViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -62,38 +66,56 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var input by rememberSaveable { mutableStateOf("") }
+    var archiveManifest by rememberSaveable { mutableStateOf("") }
 
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
         if (uri != null) {
             runCatching {
-                val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
-                require(mime.startsWith("image/") || mime == "application/pdf") {
-                    "Choose an image or PDF file."
-                }
-                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                    ?: error("Could not read the selected file.")
-                require(bytes.size <= 8 * 1024 * 1024) {
-                    "The selected file is larger than 8 MB."
-                }
-                val name = context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (column >= 0 && cursor.moveToFirst()) cursor.getString(column) else null
-                } ?: "attachment"
-                viewModel.setAttachment(
-                    PendingAttachment(
-                        name,
-                        mime,
-                        Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    )
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
-            }.onFailure {
+                AttachmentProcessor(context).read(uri)
+            }.onSuccess { attachment ->
+                viewModel.setAttachment(attachment)
+                archiveManifest = attachment.archiveManifest
+                if (attachment.archiveManifest.isNotBlank()) {
+                    Toast.makeText(
+                        context,
+                        "Archive inspected. Tap its attachment chip to view the manifest.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }.onFailure { error ->
                 Toast.makeText(
                     context,
-                    it.message ?: "Unable to attach file.",
+                    error.message ?: "Unable to access the selected file.",
                     Toast.LENGTH_LONG
                 ).show()
             }
         }
+    }
+
+    if (archiveManifest.isNotBlank()) {
+        AlertDialog(
+            onDismissRequest = { archiveManifest = "" },
+            title = { Text("Archive contents") },
+            text = {
+                Column {
+                    Text(
+                        archiveManifest,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { archiveManifest = "" }) {
+                    Text("Close")
+                }
+            }
+        )
     }
 
     val listState = rememberLazyListState()
@@ -119,7 +141,10 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
                 },
                 actions = {
                     IconButton(onClick = viewModel::clearChat) {
-                        Icon(Icons.Default.DeleteOutline, contentDescription = "Clear conversation")
+                        Icon(
+                            Icons.Default.DeleteOutline,
+                            contentDescription = "Clear conversation"
+                        )
                     }
                     IconButton(onClick = onSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "API settings")
@@ -132,6 +157,9 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
         },
         bottomBar = {
             Surface(
+                modifier = Modifier
+                    .navigationBarsPadding()
+                    .imePadding(),
                 color = MaterialTheme.colorScheme.background,
                 shadowElevation = 6.dp
             ) {
@@ -153,10 +181,19 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
                                 modifier = Modifier.size(17.dp)
                             )
                             Text(
-                                attachment.name,
-                                Modifier.weight(1f),
+                                text = attachment.name,
+                                modifier = Modifier.weight(1f),
                                 style = MaterialTheme.typography.bodySmall
                             )
+                            if (attachment.archiveManifest.isNotBlank()) {
+                                TextButton(
+                                    onClick = {
+                                        archiveManifest = attachment.archiveManifest
+                                    }
+                                ) {
+                                    Text("Inspect")
+                                }
+                            }
                             IconButton(
                                 onClick = { viewModel.setAttachment(null) },
                                 modifier = Modifier.size(32.dp)
@@ -164,18 +201,35 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
                                 Text("×", style = MaterialTheme.typography.titleLarge)
                             }
                         }
+                        val detail = buildString {
+                            attachment.sizeBytes?.let { append("${it / 1024} KB · ") }
+                            append(attachment.mimeType)
+                            if (
+                                attachment.base64.isBlank() &&
+                                attachment.extractedText.isBlank()
+                            ) {
+                                append(" · metadata only; this API may not accept this file")
+                            }
+                        }
+                        Text(
+                            detail,
+                            modifier = Modifier.padding(start = 24.dp, bottom = 4.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                     Row(verticalAlignment = Alignment.Bottom) {
-                        IconButton(
-                            onClick = { picker.launch(arrayOf("image/*", "application/pdf")) }
-                        ) {
-                            Icon(Icons.Default.AttachFile, contentDescription = "Attach image or PDF")
+                        IconButton(onClick = { picker.launch(arrayOf("*/*")) }) {
+                            Icon(
+                                Icons.Default.AttachFile,
+                                contentDescription = "Attach any file"
+                            )
                         }
                         OutlinedTextField(
                             value = input,
                             onValueChange = { input = it },
                             modifier = Modifier.weight(1f),
-                            placeholder = { Text("Message Claude…") },
+                            placeholder = { Text("Message…") },
                             shape = RoundedCornerShape(24.dp),
                             maxLines = 6
                         )
@@ -190,7 +244,8 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
                             modifier = Modifier
                                 .padding(bottom = 4.dp)
                                 .background(
-                                    if (!state.sending &&
+                                    if (
+                                        !state.sending &&
                                         (input.isNotBlank() || state.attachment != null)
                                     ) {
                                         MaterialTheme.colorScheme.primary
@@ -209,7 +264,9 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
                                 Icon(
                                     Icons.Default.Send,
                                     contentDescription = "Send message",
-                                    tint = if (input.isNotBlank() || state.attachment != null) {
+                                    tint = if (
+                                        input.isNotBlank() || state.attachment != null
+                                    ) {
                                         MaterialTheme.colorScheme.onPrimary
                                     } else {
                                         MaterialTheme.colorScheme.onSurfaceVariant
@@ -223,7 +280,9 @@ fun ChatScreen(viewModel: MainViewModel, onSettings: () -> Unit) {
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            if (state.sending) LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (state.sending) {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
             if (state.messages.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(
@@ -287,7 +346,11 @@ private fun MessageBubble(message: ChatMessage) {
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
             Text(
-                if (message.isUser) "You" else if (message.isError) "Connection error" else "Claude",
+                if (message.isUser) "You" else if (message.isError) {
+                    "Connection error"
+                } else {
+                    "Claude"
+                },
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = if (message.isError) {

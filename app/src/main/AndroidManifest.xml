@@ -4,8 +4,7 @@
     <application
         android:allowBackup="true"
         android:label="Claude Clone"
-        android:supportsRtl="true"
-        android:usesCleartextTraffic="true">
+        android:supportsRtl="true">
         <activity
             android:name="com.aibuilt.claudeclone.MainActivity"
             android:exported="true">
