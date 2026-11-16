@@ -1,11 +1,11 @@
 package com.aibuilt.claudeclone.data
 
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.SocketTimeoutException
@@ -110,13 +110,13 @@ class ApiRepository {
         val base = normalizedBase(profile.baseUrl)
         val defaultEndpoint = when (dialect) {
             "Anthropic-compatible" -> "v1/messages"
-            "Google-style" -> "v1beta/models/${encodePath(profile.model)}:generateContent"
+            "Google-style" -> "v1beta/models/${profile.model}:generateContent"
             else -> "v1/chat/completions"
         }
         val configured = profile.endpointPath.trim()
         val endpoint = when {
             dialect == "Google-style" && configured.contains("generateContent", ignoreCase = true) ->
-                configured.replace("{model}", encodePath(profile.model))
+                configured.replace("{model}", profile.model)
             dialect == "Anthropic-compatible" && configured.endsWith("/messages", ignoreCase = true) ->
                 configured
             dialect == "OpenAI-compatible" &&
@@ -127,19 +127,7 @@ class ApiRepository {
     }
 
     private fun modelsUrl(profile: ApiProfile, dialect: String): HttpUrl {
-        var base = normalizedBase(profile.baseUrl)
-        val path = base.encodedPath.trimEnd('/')
-        val knownSuffixes = listOf(
-            "/chat/completions",
-            "/messages",
-            "/generateContent"
-        )
-        val suffix = knownSuffixes.firstOrNull { path.endsWith(it, ignoreCase = true) }
-        if (suffix != null) {
-            base = base.newBuilder()
-                .encodedPath(path.dropLast(suffix.length).ifBlank { "/" })
-                .build()
-        }
+        val base = normalizedBase(profile.baseUrl)
         val modelPath = if (dialect == "Google-style") "v1beta/models" else "v1/models"
         return appendPath(base, modelPath)
     }
@@ -152,14 +140,26 @@ class ApiRepository {
                 trimmed.startsWith("http://", ignoreCase = true)
         ) { "Base URL must start with http:// or https://." }
 
-        val parsed = trimmed.toHttpUrlOrNull()
+        var base = trimmed.toHttpUrlOrNull()
             ?: throw IllegalArgumentException("The base URL is invalid. Check its scheme, host, and port.")
-        require(parsed.host.isNotBlank()) { "Base URL must include a server host." }
+        require(base.host.isNotBlank()) { "Base URL must include a server host." }
 
-        var base = parsed
         val path = base.encodedPath.trimEnd('/')
-        val removable = listOf("/chat/completions", "/messages", "/generateContent")
-            .firstOrNull { path.endsWith(it, ignoreCase = true) }
+        val generationEndpoint = Regex(
+            """/(?:v1beta/)?models/[^/]+:generatecontent$""",
+            RegexOption.IGNORE_CASE
+        )
+        val removable = listOf(
+            "/v1/chat/completions",
+            "/chat/completions",
+            "/v1/messages",
+            "/messages",
+            "/v1beta/models",
+            "/v1/models",
+            "/models"
+        ).firstOrNull { path.endsWith(it, ignoreCase = true) }
+            ?: generationEndpoint.find(path)?.value
+
         if (removable != null) {
             base = base.newBuilder()
                 .encodedPath(path.dropLast(removable.length).ifBlank { "/" })
@@ -186,7 +186,7 @@ class ApiRepository {
         val remaining = pathParts.drop(overlap)
 
         val builder = base.newBuilder()
-        remaining.forEach { part -> builder.addPathSegment(part) }
+        remaining.forEach { part -> builder.addPathSegment(decodePath(part)) }
 
         val pathQuery = absolute.substringAfter('?', "").takeIf(String::isNotBlank)
         if (pathQuery != null) {
@@ -247,6 +247,7 @@ class ApiRepository {
                 if (!response.isSuccessful) {
                     val explanation = when (response.code) {
                         401, 403 -> "Authentication was rejected. Check the API key and authentication format."
+                        402 -> "Payment is required by the API provider. Check the provider's billing page for a required top-up, credits, or an active payment method."
                         404 -> "The endpoint was not found. Check the base URL and API format."
                         400, 422 -> "The server rejected the request. Check the model ID and request format."
                         429 -> "The server is rate limiting requests. Wait and try again."
@@ -264,6 +265,8 @@ class ApiRepository {
             }
         } catch (e: ApiHttpException) {
             throw IllegalStateException(e.message, e)
+        } catch (e: IllegalStateException) {
+            throw e
         } catch (e: Exception) {
             val reason = when (e) {
                 is UnknownHostException ->
@@ -526,18 +529,49 @@ class ApiRepository {
     }
 
     private fun readPath(root: Any, path: String): Any? {
+        val normalizedPath = path.trim().removePrefix("$.")
+        if (normalizedPath.isEmpty()) return root
+
         var current: Any? = root
-        val tokens = Regex("""([^.[\]]+)|\[(\d+)]""").findAll(path.removePrefix("$."))
-        for (token in tokens) {
-            current = when {
-                token.groupValues[2].isNotEmpty() ->
-                    (current as? JSONArray)?.opt(token.groupValues[2].toIntOrNull() ?: return null)
-                current is JSONObject ->
-                    current.opt(token.groupValues[1]).takeUnless { it == JSONObject.NULL }
-                else -> null
+        var cursor = 0
+
+        while (cursor < normalizedPath.length) {
+            if (normalizedPath[cursor] == '.') {
+                cursor++
+                continue
+            }
+
+            val token: String
+            if (normalizedPath[cursor] == '[') {
+                val closingBracket = normalizedPath.indexOf(']', startIndex = cursor + 1)
+                if (closingBracket < 0) return null
+                token = normalizedPath.substring(cursor + 1, closingBracket)
+                    .trim()
+                    .removeSurrounding("\"")
+                    .removeSurrounding("'")
+                cursor = closingBracket + 1
+            } else {
+                val start = cursor
+                while (
+                    cursor < normalizedPath.length &&
+                    normalizedPath[cursor] != '.' &&
+                    normalizedPath[cursor] != '['
+                ) {
+                    cursor++
+                }
+                token = normalizedPath.substring(start, cursor)
+            }
+
+            if (token.isEmpty()) return null
+            current = when (val value = current) {
+                is JSONObject -> value.opt(token).takeUnless { it == JSONObject.NULL }
+                is JSONArray -> value.opt(token.toIntOrNull() ?: return null)
+                    .takeUnless { it == JSONObject.NULL }
+                else -> return null
             }
             if (current == null) return null
         }
+
         return current
     }
 
@@ -572,9 +606,6 @@ class ApiRepository {
         Regex("""\{([A-Za-z][A-Za-z0-9_]*)}""").replace(template) { match ->
             values[match.groupValues[1]] ?: match.value
         }
-
-    private fun encodePath(value: String): String =
-        URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
     private fun decodePath(value: String): String =
         runCatching { java.net.URLDecoder.decode(value, "UTF-8") }.getOrDefault(value)
