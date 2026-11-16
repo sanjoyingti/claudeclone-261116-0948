@@ -22,7 +22,10 @@ data class AppState(
     val sending: Boolean = false,
     val testing: Boolean = false,
     val testReport: String = "",
-    val attachment: PendingAttachment? = null
+    val attachment: PendingAttachment? = null,
+    val availableModels: List<String> = emptyList(),
+    val modelsLoading: Boolean = false,
+    val modelsError: String = ""
 ) {
     val activeProfile: ApiProfile
         get() = profiles.getOrElse(activeProfileIndex) { ApiProfile() }
@@ -53,7 +56,12 @@ class MainViewModel(
         val current = mutableState.value
         if (index !in current.profiles.indices) return
         storage.saveActiveIndex(index)
-        mutableState.value = current.copy(activeProfileIndex = index, testReport = "")
+        mutableState.value = current.copy(
+            activeProfileIndex = index,
+            testReport = "",
+            availableModels = emptyList(),
+            modelsError = ""
+        )
     }
 
     fun addProfile() {
@@ -68,8 +76,9 @@ class MainViewModel(
 
     fun duplicateProfile() {
         val current = mutableState.value
-        val profile = current.activeProfile.copy(name = "${current.activeProfile.name} copy")
-        val profiles = current.profiles + profile
+        val profiles = current.profiles + current.activeProfile.copy(
+            name = "${current.activeProfile.name} copy"
+        )
         storage.saveActiveIndex(profiles.lastIndex)
         save(profiles = profiles, index = profiles.lastIndex)
     }
@@ -80,7 +89,9 @@ class MainViewModel(
             updateProfile { ApiProfile() }
             return
         }
-        val profiles = current.profiles.toMutableList().apply { removeAt(current.activeProfileIndex) }
+        val profiles = current.profiles.toMutableList().apply {
+            removeAt(current.activeProfileIndex)
+        }
         val index = current.activeProfileIndex.coerceAtMost(profiles.lastIndex)
         storage.saveActiveIndex(index)
         save(profiles = profiles, index = index)
@@ -106,10 +117,52 @@ class MainViewModel(
         mutableState.value = mutableState.value.copy(messages = emptyList())
     }
 
+    fun discoverModels() {
+        val current = mutableState.value
+        if (current.modelsLoading || current.activeProfile.baseUrl.isBlank()) return
+
+        val requestedProfile = current.activeProfile
+        mutableState.value = current.copy(modelsLoading = true, modelsError = "")
+
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    api.discoverModels(requestedProfile)
+                }
+            }
+            val latest = mutableState.value
+            if (latest.activeProfile.baseUrl.trim() != requestedProfile.baseUrl.trim() ||
+                latest.activeProfile.authValue != requestedProfile.authValue
+            ) {
+                mutableState.value = latest.copy(modelsLoading = false)
+                return@launch
+            }
+
+            result.onSuccess { models ->
+                mutableState.value = mutableState.value.copy(
+                    modelsLoading = false,
+                    availableModels = models,
+                    modelsError = ""
+                )
+                if (requestedProfile.model.isBlank() && models.isNotEmpty()) {
+                    updateProfile { profile ->
+                        if (profile.model.isBlank()) profile.copy(model = models.first()) else profile
+                    }
+                }
+            }.onFailure { error ->
+                mutableState.value = mutableState.value.copy(
+                    modelsLoading = false,
+                    modelsError = error.message ?: "Model discovery failed."
+                )
+            }
+        }
+    }
+
     fun sendMessage(text: String) {
         val current = mutableState.value
         val cleanText = text.trim()
         if (current.sending || (cleanText.isEmpty() && current.attachment == null)) return
+
         val userMessage = ChatMessage(
             text = cleanText,
             isUser = true,
@@ -118,6 +171,7 @@ class MainViewModel(
         val messages = current.messages + userMessage
         storage.saveMessages(messages)
         mutableState.value = current.copy(messages = messages, sending = true, testReport = "")
+
         viewModelScope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
@@ -128,15 +182,19 @@ class MainViewModel(
                         history = current.messages
                     )
                 }
-                val updated = mutableState.value.messages + ChatMessage(text = result.text, isUser = false)
+                val updated = mutableState.value.messages +
+                    ChatMessage(text = result.text, isUser = false)
                 storage.saveMessages(updated)
                 mutableState.value = mutableState.value.copy(
-                    messages = updated, sending = false, attachment = null
+                    messages = updated,
+                    sending = false,
+                    attachment = null
                 )
-            } catch (e: Exception) {
-                val message = e.message ?: "Unknown connection error."
+            } catch (error: Exception) {
                 val updated = mutableState.value.messages + ChatMessage(
-                    text = message, isUser = false, isError = true
+                    text = error.message ?: "Unknown connection error.",
+                    isUser = false,
+                    isError = true
                 )
                 storage.saveMessages(updated)
                 mutableState.value = mutableState.value.copy(messages = updated, sending = false)
@@ -148,14 +206,47 @@ class MainViewModel(
         val current = mutableState.value
         if (current.testing) return
         mutableState.value = current.copy(testing = true, testReport = "Connecting…")
+
         viewModelScope.launch {
-            val report = withContext(Dispatchers.IO) {
-                try {
-                    val result = api.send(current.activeProfile, "Reply with OK.")
-                    "${result.report}\n\nExtracted reply: ${result.text.take(300)}"
-                } catch (e: Exception) {
-                    e.message ?: "Connection test failed: ${e.javaClass.simpleName}"
+            val result = withContext(Dispatchers.IO) {
+                val discovery = runCatching { api.discoverModels(current.activeProfile) }
+                val models = discovery.getOrNull().orEmpty()
+                val profileForTest = if (current.activeProfile.model.isNotBlank()) {
+                    current.activeProfile
+                } else if (models.isNotEmpty()) {
+                    current.activeProfile.copy(model = models.first())
+                } else {
+                    current.activeProfile
                 }
+                val connection = runCatching { api.send(profileForTest, "Reply with OK.") }
+                Triple(discovery, models, connection)
+            }
+
+            if (result.second.isNotEmpty()) {
+                mutableState.value = mutableState.value.copy(availableModels = result.second)
+                if (current.activeProfile.model.isBlank()) {
+                    updateProfile { profile ->
+                        if (profile.model.isBlank()) profile.copy(model = result.second.first()) else profile
+                    }
+                }
+            }
+
+            val report = buildString {
+                if (result.first.isSuccess) {
+                    append("Discovered ${result.second.size} model(s)")
+                    if (result.second.isNotEmpty()) append(": ${result.second.joinToString(", ")}")
+                    append(".")
+                } else {
+                    append("Model discovery failed: ")
+                    append(result.first.exceptionOrNull()?.message ?: "Unknown discovery error.")
+                    append("\nThe selected model remains available for chat.")
+                }
+                append("\n\n")
+                append(
+                    result.third.getOrNull()?.report
+                        ?: result.third.exceptionOrNull()?.message
+                        ?: "Connection test failed."
+                )
             }
             mutableState.value = mutableState.value.copy(testing = false, testReport = report)
         }
